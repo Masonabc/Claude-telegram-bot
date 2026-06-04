@@ -6,6 +6,7 @@ Supports interactive prompts, plan mode, and multiple working directories.
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 import requests
@@ -26,6 +27,38 @@ try:
 except Exception:
     def _malloc_trim():
         pass
+
+
+def _ensure_tools_in_path():
+    """Guarantee `node` is reachable on PATH for spawned Claude subprocesses.
+
+    The bot is often launched detached (PPID=1) from an environment whose PATH
+    lacks the dir holding `node` (nvm / homebrew). Claude CLI plugin hooks
+    invoke a bare `node`, so they fail with 'node: command not found' and
+    surface in Telegram as "No output". Since every spawn uses
+    os.environ.copy(), prepending node's dir here fixes all of them at once.
+    Idempotent: a no-op when node is already resolvable.
+    """
+    if shutil.which("node"):
+        return
+    candidates = []
+    nvm_dir = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_dir.is_dir():
+        def _ver_key(p):
+            m = re.match(r"v(\d+)\.(\d+)\.(\d+)", p.name)
+            return tuple(int(g) for g in m.groups()) if m else (0, 0, 0)
+        candidates += [v / "bin" for v in
+                       sorted((p for p in nvm_dir.iterdir() if p.is_dir()),
+                              key=_ver_key, reverse=True)]
+    candidates += [Path("/opt/homebrew/bin"), Path("/usr/local/bin"),
+                   Path("/usr/bin")]
+    for d in candidates:
+        if (d / "node").exists():
+            os.environ["PATH"] = f"{d}{os.pathsep}{os.environ.get('PATH', '')}"
+            return
+
+
+_ensure_tools_in_path()
 
 # Configuration
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
@@ -66,6 +99,7 @@ _sessions_file_lock = threading.Lock()  # protects user_sessions dict and sessio
 omni_active = {}  # "chat_id:session_id" -> state
 cancelled_sessions = set()  # session_ids explicitly cancelled via /cancel
 user_feedback_queue = {}  # "chat_id:session_id" -> [messages] — user messages during justdoit/omni
+pending_claude_sessions = {}  # chat_key -> [candidate dicts] — /csessions scan results awaiting selection
 scheduled_tasks = {}  # task_id -> {id, chat_id, cwd, prompt, schedule_type, cron_expr, last_result, ...}
 _scheduled_tasks_lock = threading.Lock()
 _scheduler_generation = 0
@@ -1372,10 +1406,22 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                   f"activity_log has {len(activity_log)} entries, last Claude at idx {last_claude_idx}, "
                   f"last 3 entries: {activity_log[-3:] if activity_log else 'empty'}", flush=True)
 
-    # Resume with Claude's session ID if available
+    # Resume with Claude's session ID if available — but only when the session
+    # file actually exists on disk. A stale id (a -p session that never
+    # persisted, or one that was cleaned up) makes `--resume` fail with
+    # "No conversation found" and blocks every message; in that case drop the
+    # id and start a fresh conversation instead of getting stuck.
     claude_session_id = session.get("claude_session_id") if session else None
     if claude_session_id:
-        cmd.extend(["--resume", claude_session_id])
+        _proj = os.path.abspath(cwd or os.getcwd()).replace(os.sep, "-")
+        _sid_file = os.path.expanduser(f"~/.claude/projects/{_proj}/{claude_session_id}.jsonl")
+        if os.path.exists(_sid_file):
+            cmd.extend(["--resume", claude_session_id])
+        else:
+            print(f"[Claude] stale session id {claude_session_id} (no file on disk); starting fresh", flush=True)
+            if session:
+                update_claude_session_id(chat_id, session, None)
+            claude_session_id = None
 
     # Update session with the latest action
     if session:
@@ -2071,6 +2117,156 @@ def update_cli_session_id(chat_id, session, cli_name, new_sid):
 def update_claude_session_id(chat_id, session, claude_session_id):
     """Legacy wrapper for Claude session ID updates."""
     update_cli_session_id(chat_id, session, "Claude", claude_session_id)
+
+
+def _fmt_ago(ts):
+    """Human-readable relative time (Chinese) for a unix timestamp."""
+    d = max(0, time.time() - ts)
+    if d < 60:
+        return "刚刚"
+    if d < 3600:
+        return f"{int(d // 60)}分钟前"
+    if d < 86400:
+        return f"{int(d // 3600)}小时前"
+    return f"{int(d // 86400)}天前"
+
+
+def _read_jsonl_meta(path, head_lines=40, tail_lines=80):
+    """Cheaply extract metadata from a (possibly ~30MB) Claude session jsonl by
+    reading only the first/last few lines — never the whole file. Returns dict
+    with session_id/cwd/custom_title/summary/first_user (any may be None)."""
+    meta = {"session_id": None, "cwd": None, "custom_title": None,
+            "summary": None, "first_user": None}
+
+    def _scan(lines):
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                d = json.loads(ln)
+            except Exception:
+                continue
+            if not meta["session_id"] and d.get("sessionId"):
+                meta["session_id"] = d.get("sessionId")
+            if not meta["cwd"] and d.get("cwd"):
+                meta["cwd"] = d.get("cwd")
+            t = d.get("type")
+            if t == "custom-title":
+                meta["custom_title"] = d.get("title") or d.get("content") or meta["custom_title"]
+            elif t == "summary" and not meta["summary"]:
+                meta["summary"] = d.get("summary")
+            elif t == "user" and not meta["first_user"]:
+                m = d.get("message", {})
+                c = m.get("content") if isinstance(m, dict) else None
+                text = None
+                if isinstance(c, list):
+                    for blk in c:
+                        if isinstance(blk, dict) and blk.get("type") == "text":
+                            text = blk.get("text") or ""
+                            break
+                elif isinstance(c, str):
+                    text = c
+                if text:
+                    ts = text.strip()
+                    # skip system-injected envelopes (caveats, slash-command wrappers, interrupts)
+                    if not (ts.startswith("<") or ts.startswith("Caveat:")
+                            or "local-command" in ts or "[Request interrupted" in ts):
+                        meta["first_user"] = ts[:120]
+
+    try:
+        head = []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(head_lines):
+                ln = f.readline()
+                if not ln:
+                    break
+                head.append(ln)
+        _scan(head)
+
+        with open(path, "rb") as fb:
+            fb.seek(0, 2)
+            pos = fb.tell()
+            block = 65536
+            data = b""
+            while pos > 0 and data.count(b"\n") <= tail_lines:
+                step = min(block, pos)
+                pos -= step
+                fb.seek(pos)
+                data = fb.read(step) + data
+            tail = data.decode("utf-8", errors="replace").splitlines()[-tail_lines:]
+        _scan(tail)
+    except Exception:
+        pass
+    return meta
+
+
+def _session_title(meta):
+    """Pick a display title for a Claude session from its metadata."""
+    raw = (meta.get("custom_title") or meta.get("summary")
+           or meta.get("first_user") or (meta.get("session_id") or "")[:8])
+    raw = " ".join(str(raw).split())  # collapse newlines/whitespace
+    title = raw[:50] + ("…" if len(raw) > 50 else "")
+    if "/.claude/worktrees/" in (meta.get("cwd") or ""):
+        title = "🌿 " + title
+    return title or "(untitled)"
+
+
+def list_claude_sessions(cwd=None, limit=20):
+    """Scan ~/.claude/projects for real Claude CLI sessions.
+
+    If cwd is given, only that project's dir (case-insensitive match on the
+    encoded path); else all projects. Sorted by mtime desc, capped at limit.
+    Returns: [{session_id, cwd, title, mtime, size, jsonl_path}].
+    """
+    projects = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    if not os.path.isdir(projects):
+        return []
+    try:
+        all_dirs = os.listdir(projects)
+    except Exception:
+        return []
+
+    if cwd:
+        want = os.path.abspath(cwd).replace(os.sep, "-")
+        target_dirs = [d for d in all_dirs if d.lower() == want.lower()]
+    else:
+        target_dirs = all_dirs
+
+    files = []  # (path, mtime, size, uuid_stem) — metadata only, no content read
+    for d in target_dirs:
+        dpath = os.path.join(projects, d)
+        if not os.path.isdir(dpath):
+            continue
+        try:
+            entries = os.listdir(dpath)
+        except Exception:
+            continue
+        for fn in entries:
+            if not fn.endswith(".jsonl"):
+                continue
+            fpath = os.path.join(dpath, fn)
+            try:
+                st = os.stat(fpath)
+            except Exception:
+                continue
+            files.append((fpath, st.st_mtime, st.st_size, fn[:-6]))
+
+    files.sort(key=lambda x: x[1], reverse=True)
+    files = files[:limit]
+
+    out = []
+    for fpath, mtime, size, uuid_stem in files:
+        meta = _read_jsonl_meta(fpath)
+        out.append({
+            "session_id": meta.get("session_id") or uuid_stem,
+            "cwd": meta.get("cwd") or (cwd or ""),
+            "title": _session_title(meta),
+            "mtime": mtime,
+            "size": size,
+            "jsonl_path": fpath,
+        })
+    return out
 
 
 def save_session_summary(chat_id, session, summary):
@@ -5490,6 +5686,7 @@ def handle_command(chat_id, text):
 • `/new <project>` - Start new session in ~/project
 • `/resume` - Pick a session to resume
 • `/sessions` - List your sessions
+• `/csessions [项目|all]` - 复用电脑上的 Claude 会话
 • `/plan` - Enter plan mode
 • `/justdoit [task]` - Autonomous implementation mode
 • `/deepreview` - Deep multi-phase code review
@@ -5622,6 +5819,7 @@ Example: `/schedule daily 09:00 | Run tests and fix failures`""")
 
 • `/resume` - Pick a session to resume (with buttons)
 • `/sessions` - List all your sessions (🔄 = running)
+• `/csessions [项目|all]` - 浏览并复用电脑上的 Claude 会话(终端里跑的也能续)
 • `/switch <name>` - Switch to a session by name
 • `/delete <name>` - Delete a session (or `/delete all`)
 • `/reset` - Clear conversation history (fresh start)
@@ -5713,7 +5911,8 @@ Send a message to start working!""")
             send_message(chat_id, "No sessions yet. Use `/new <project>` to start one.")
             return True
 
-        lines = ["*Your Sessions:*\n"]
+        lines = ["*Your Sessions* (点按钮切换/恢复):\n"]
+        keyboard = []
         for s in sessions[-10:]:  # Last 10 sessions
             session_id = get_session_id(s)
             is_active = session_id == active_id or s.get("cwd") == active_id
@@ -5726,10 +5925,47 @@ Send a message to start working!""")
             if last_prompt:
                 snippet = last_prompt[:50] + "..." if len(last_prompt) > 50 else last_prompt
                 lines.append(f"    _{snippet}_")
+            # Tappable button to switch/resume this session (reuses resume_<idx> callback)
+            idx = user_data["sessions"].index(s)
+            btn = ("→ " if is_active else "") + (f"🔄 {s['name']}" if is_busy else s['name'])
+            keyboard.append([{"text": btn, "callback_data": f"resume_{idx}"}])
 
-        lines.append("\n🔄 = running task")
-        lines.append("\nUse `/resume` to pick a session or `/switch <name>`")
-        send_message(chat_id, "\n".join(lines))
+        lines.append("\n🔄 = running · → = current")
+        send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
+        return True
+
+    if cmd == "/csessions":
+        chat_key = str(chat_id)
+        scope = args.strip()
+        if scope.lower() == "all":
+            scan_cwd = None
+            scope_desc = "所有项目"
+        elif scope:
+            scan_cwd = scope if scope.startswith("/") else os.path.join(BASE_PROJECTS_DIR, scope)
+            scope_desc = f"`{scan_cwd}`"
+        else:
+            active = get_active_session(chat_id)
+            if not active:
+                send_message(chat_id, "当前没有 active session。先 `/new <项目>`,或用 `/csessions all` 查看全部 Claude 会话。")
+                return True
+            scan_cwd = active.get("cwd")
+            scope_desc = f"`{scan_cwd}`"
+
+        candidates = list_claude_sessions(cwd=scan_cwd, limit=12)
+        if not candidates:
+            send_message(chat_id, f"在 {scope_desc} 下没找到 Claude 会话。\n试试 `/csessions all` 查看全部。")
+            return True
+
+        pending_claude_sessions[chat_key] = candidates
+        lines = [f"*电脑上的 Claude 会话* ({scope_desc})\n_点按钮导入到 bot 继续这段对话_\n"]
+        keyboard = []
+        for i, c in enumerate(candidates):
+            ago = _fmt_ago(c["mtime"])
+            mb = c["size"] / (1024 * 1024)
+            btn = f"{c['title'][:40]} · {ago}"
+            keyboard.append([{"text": btn, "callback_data": f"ccsess_{i}"}])
+            lines.append(f"• *{c['title']}* — {ago}, {mb:.1f}MB")
+        send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
         return True
 
     if cmd == "/resume":
@@ -6351,6 +6587,47 @@ def handle_callback_query(callback_query):
         send_message(chat_id, "❌ Session not found.")
         return
 
+    # Handle Claude session browse/import (/csessions)
+    if data.startswith("ccsess_") or data.startswith("ccimport_"):
+        is_confirm = data.startswith("ccimport_")
+        try:
+            idx = int(data.split("_", 1)[1])
+            cands = pending_claude_sessions.get(chat_key, [])
+            if not (0 <= idx < len(cands)):
+                raise IndexError
+            cand = cands[idx]
+        except (ValueError, IndexError):
+            send_message(chat_id, "❌ 选项已过期,请重新 `/csessions`。")
+            return
+
+        # Occupancy warning: jsonl modified very recently → likely open on desktop
+        if not is_confirm and (time.time() - cand["mtime"]) < 300:
+            ago = _fmt_ago(cand["mtime"])
+            kb = {"inline_keyboard": [
+                [{"text": "⚠️ 仍然接管", "callback_data": f"ccimport_{idx}"}],
+                [{"text": "取消", "callback_data": "cccancel"}],
+            ]}
+            send_message(chat_id,
+                         f"⚠️ 这个会话 {ago} 还在改动,可能正在电脑上使用。\n"
+                         f"两边同时用同一会话可能造成记录冲突。仍要接管吗?",
+                         reply_markup=kb)
+            return
+
+        # Import: bind a new bot session to this real Claude session id
+        name = os.path.basename(cand["cwd"].rstrip("/")) or "claude"
+        session = create_session(chat_id, name, cand["cwd"])
+        update_claude_session_id(chat_id, session, cand["session_id"])
+        set_active_session(chat_id, get_session_id(session))
+        _ws_broadcast(chat_id, "active_session", {"session": session["name"]})
+        send_message(chat_id,
+                     f"✅ 已导入 Claude 会话 `{cand['session_id'][:8]}`\n"
+                     f"目录: `{cand['cwd']}`\n\n直接发消息即可继续这段对话。")
+        return
+
+    if data == "cccancel":
+        send_message(chat_id, "已取消。")
+        return
+
     pending = pending_questions.get(chat_key)
 
     if not pending:
@@ -6704,6 +6981,7 @@ def startup():
             {"command": "new", "description": "Start new session - /new <project>"},
             {"command": "resume", "description": "Pick a session to resume"},
             {"command": "sessions", "description": "List all sessions"},
+            {"command": "csessions", "description": "Reuse a desktop Claude session"},
             {"command": "status", "description": "Show current session info"},
             {"command": "plan", "description": "Enter plan mode"},
             {"command": "approve", "description": "Approve current plan"},

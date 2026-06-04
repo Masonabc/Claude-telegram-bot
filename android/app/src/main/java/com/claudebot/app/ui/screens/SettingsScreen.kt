@@ -74,7 +74,7 @@ fun SettingsScreen(viewModel: ChatViewModel) {
                 value = host,
                 onValueChange = { host = it },
                 label = { Text("Tailscale IP") },
-                placeholder = { Text("100.118.238.103") },
+                placeholder = { Text("100.98.175.65") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 colors = fieldColors

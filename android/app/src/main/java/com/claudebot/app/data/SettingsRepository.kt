@@ -11,7 +11,7 @@ class SettingsRepository(context: Context) {
     private val notificationLock = Any()
 
     var host: String
-        get() = prefs.getString("host", "100.118.238.103") ?: "100.118.238.103"
+        get() = prefs.getString("host", "100.98.175.65") ?: "100.98.175.65"
         set(value) = prefs.edit().putString("host", value).apply()
 
     var port: Int

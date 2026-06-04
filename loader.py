@@ -28,6 +28,7 @@ _STATE_KEYS = [
     # Session and process state
     "user_sessions", "pending_questions", "active_processes",
     "message_queue", "cancelled_sessions", "user_feedback_queue",
+    "pending_claude_sessions",
     # Autonomous task state
     "justdoit_active", "deepreview_active", "omni_active",
     # Scheduled tasks
