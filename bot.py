@@ -2153,7 +2153,8 @@ def _read_jsonl_meta(path, head_lines=40, tail_lines=80):
                 meta["cwd"] = d.get("cwd")
             t = d.get("type")
             if t == "custom-title":
-                meta["custom_title"] = d.get("title") or d.get("content") or meta["custom_title"]
+                meta["custom_title"] = (d.get("customTitle") or d.get("title")
+                                        or d.get("content") or meta["custom_title"])
             elif t == "summary" and not meta["summary"]:
                 meta["summary"] = d.get("summary")
             elif t == "user" and not meta["first_user"]:
