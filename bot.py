@@ -100,6 +100,7 @@ omni_active = {}  # "chat_id:session_id" -> state
 cancelled_sessions = set()  # session_ids explicitly cancelled via /cancel
 user_feedback_queue = {}  # "chat_id:session_id" -> [messages] — user messages during justdoit/omni
 pending_claude_sessions = {}  # chat_key -> [candidate dicts] — /csessions scan results awaiting selection
+pending_projects = {}  # chat_key -> [project_name] — /projects dir list awaiting tap selection
 scheduled_tasks = {}  # task_id -> {id, chat_id, cwd, prompt, schedule_type, cron_expr, last_result, ...}
 _scheduled_tasks_lock = threading.Lock()
 _scheduler_generation = 0
@@ -244,7 +245,7 @@ def check_interrupted_sessions():
                 msg += f"\n• *{name}*: _{prompt[:100]}_"
             msg += "\n\n_Sessions preserved — send a message to continue._"
             try:
-                send_message(int(chat_id), msg)
+                send_message(_chat_id_from_key(chat_id), msg)
             except Exception as e:
                 print(f"Error notifying {chat_id} about interrupted sessions: {e}")
 
@@ -316,7 +317,7 @@ def check_interrupted_tasks():
                 msg += f": _{task_desc[:100]}_"
             msg += "\n\n_Sessions preserved. Use the original command to restart or send a message to continue manually._"
             try:
-                send_message(int(chat_id), msg)
+                send_message(_chat_id_from_key(chat_id), msg)
             except Exception as e:
                 print(f"Error notifying {chat_id} about interrupted tasks: {e}")
 
@@ -664,7 +665,7 @@ def create_scheduled_task(chat_id, prompt, schedule_type, cron_expr=None, run_at
     with _scheduled_tasks_lock:
         scheduled_tasks[task_id] = task
     save_scheduled_tasks()
-    _ws_broadcast_schedule(int(chat_id), "created", task_id, task)
+    _ws_broadcast_schedule(_chat_id_from_key(chat_id), "created", task_id, task)
     return task_id, task
 
 
@@ -680,7 +681,7 @@ def _save_sched_result(task_id, result_text):
         task = scheduled_tasks.get(task_id)
         if task:
             task["last_result"] = result_text
-            chat_id = int(task["chat_id"])
+            chat_id = _chat_id_from_key(task["chat_id"])
         else:
             return
     save_scheduled_tasks()
@@ -701,7 +702,7 @@ def _finalize_sched_result(result_text, strip_completion=False):
 
 def _trigger_scheduled_task(task_id, task):
     """Execute a due scheduled task. Session-free: uses stored cwd and last_result as context."""
-    chat_id = int(task["chat_id"])
+    chat_id = _chat_id_from_key(task["chat_id"])
     prompt = task.get("prompt", "")
     cwd = task.get("cwd", os.getcwd())
 
@@ -821,12 +822,41 @@ def _ws_stream(chat_id, op, message_id, session="", **kwargs):
     _ws_broadcast(chat_id, "stream", data)
 
 
+def _is_feishu(chat_id):
+    return str(chat_id).startswith("feishu:")
+
+
+def _chat_id_from_key(value):
+    """chat_id values are ints for Telegram, 'feishu:...' strings for Feishu."""
+    s = str(value)
+    return s if s.startswith("feishu:") else int(s)
+
+
+def _feishu_input(chat_id, title, placeholder, cmd, default=""):
+    """On Feishu, pop a card with a text input box for a parameter-taking command.
+    Returns True if shown (Feishu only); False elsewhere so callers fall back to a usage hint."""
+    if not _is_feishu(chat_id):
+        return False
+    try:
+        import feishu_channel
+        feishu_channel.send_input_card(chat_id, title, placeholder, cmd, default)
+        return True
+    except Exception as e:
+        print(f"feishu input card failed: {e}", flush=True)
+        return False
+
+
 def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retries=3, session_name=None):
     """Send a message back to the user. Returns message_id.
     Retries on network/timeout errors with exponential backoff.
     Also broadcasts via WebSocket unless _ws_suppress is set (stream events replace it).
     session_name: if provided, use this as the WS session label instead of get_active_session().
     """
+    if _is_feishu(chat_id):
+        import feishu_channel
+        return feishu_channel.send_message(chat_id, text, reply_markup=reply_markup,
+                                           parse_mode=parse_mode, retries=retries,
+                                           session_name=session_name)
     max_len = 4000
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
     message_id = None
@@ -897,6 +927,10 @@ def send_message_no_ws(chat_id, text, reply_markup=None, parse_mode="Markdown"):
     """Send a message to TG only, without broadcasting via WebSocket.
     Used for echo messages from the app (app already shows them locally).
     """
+    if _is_feishu(chat_id):
+        import feishu_channel
+        feishu_channel.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
     payload = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -922,6 +956,11 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
     Also broadcasts via WebSocket unless _ws_suppress is set (stream events replace it).
     """
     global _last_edit_cleanup
+
+    if _is_feishu(chat_id):
+        import feishu_channel
+        return feishu_channel.edit_message(chat_id, message_id, text,
+                                           parse_mode=parse_mode, force=force)
 
     if not message_id:
         if force:
@@ -1007,6 +1046,9 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
 
 def send_document(chat_id, file_path, caption=None):
     """Send a file to the user via Telegram."""
+    if _is_feishu(chat_id):
+        send_message(chat_id, f"📎 `{os.path.basename(file_path)}`\n\n⚠️ 飞书端暂不支持发送文件 (开发中)")
+        return False
     try:
         with open(file_path, "rb") as f:
             payload = {"chat_id": chat_id}
@@ -1029,6 +1071,8 @@ def send_document(chat_id, file_path, caption=None):
 
 def send_photo(chat_id, file_path, caption=None):
     """Send a photo to the user via Telegram."""
+    if _is_feishu(chat_id):
+        return send_document(chat_id, file_path, caption=caption)
     try:
         with open(file_path, "rb") as f:
             payload = {"chat_id": chat_id}
@@ -1053,6 +1097,8 @@ def send_photo(chat_id, file_path, caption=None):
 
 def send_typing(chat_id):
     """Send typing indicator."""
+    if _is_feishu(chat_id):
+        return  # No typing indicator API on Feishu
     try:
         requests.post(f"{API_URL}/sendChatAction",
                      json={"chat_id": chat_id, "action": "typing"}, timeout=10)
@@ -1062,6 +1108,8 @@ def send_typing(chat_id):
 
 def answer_callback_query(callback_query_id, text=None):
     """Answer a callback query."""
+    if _is_feishu(callback_query_id):
+        return  # Feishu card callback is acked via the card-action response
     try:
         payload = {"callback_query_id": callback_query_id}
         if text:
@@ -1073,6 +1121,8 @@ def answer_callback_query(callback_query_id, text=None):
 
 def edit_message_reply_markup(chat_id, message_id, reply_markup=None):
     """Remove inline keyboard after selection."""
+    if _is_feishu(chat_id):
+        return  # Feishu buttons are removed by the card-action response card
     try:
         requests.post(f"{API_URL}/editMessageReplyMarkup",
                      json={"chat_id": chat_id, "message_id": message_id,
@@ -2332,6 +2382,9 @@ def reset_message_count(chat_id, session, cli_name):
 
 def is_allowed(chat_id):
     """Check if the chat ID is allowed."""
+    if _is_feishu(chat_id):
+        import feishu_channel
+        return feishu_channel.is_allowed(chat_id)
     if not ALLOWED_CHAT_IDS or ALLOWED_CHAT_IDS == [""]:
         print("Warning: No ALLOWED_CHAT_IDS set. Allowing all users.")
         return True
@@ -5699,6 +5752,9 @@ Send any message to chat with Claude!""")
 
     if cmd == "/schedule":
         if not args:
+            if _feishu_input(chat_id, "⏰ *定时任务*\n格式: `时间 | 任务`",
+                             "如 daily 09:00 | 检查并修复测试", "/schedule"):
+                return True
             send_message(chat_id, """*Schedule a task:*
 `/schedule daily HH:MM | prompt`
 `/schedule weekly DAY HH:MM | prompt`
@@ -5879,6 +5935,9 @@ Just send a message to chat with Claude!""")
 
     if cmd == "/new":
         if not args:
+            if _feishu_input(chat_id, "📂 *新建会话*\n输入项目名或绝对路径:",
+                             "如 life-companion 或 /Users/mason/...", "/new"):
+                return True
             send_message(chat_id, "Usage: `/new <project_name>`\nExample: `/new lifecompanion`")
             return True
 
@@ -5902,6 +5961,31 @@ Just send a message to chat with Claude!""")
 Send a message to start working!""")
         return True
 
+    if cmd in ("/projects", "/cd", "/p"):
+        try:
+            entries = []
+            for name in os.listdir(BASE_PROJECTS_DIR):
+                full = os.path.join(BASE_PROJECTS_DIR, name)
+                if name.startswith(".") or not os.path.isdir(full):
+                    continue
+                entries.append((name, os.path.getmtime(full)))
+        except Exception as e:
+            send_message(chat_id, f"❌ Could not list projects: {e}")
+            return True
+
+        if not entries:
+            send_message(chat_id, f"No project folders found in `{BASE_PROJECTS_DIR}`.")
+            return True
+
+        # Most-recently-modified first; cap so the card/keyboard stays tappable
+        entries.sort(key=lambda e: e[1], reverse=True)
+        names = [n for n, _ in entries[:24]]
+        pending_projects[str(chat_id)] = names
+
+        keyboard = [[{"text": f"📁 {n}", "callback_data": f"proj_{i}"}] for i, n in enumerate(names)]
+        send_message(chat_id, "*选择项目* (点一下进入):", reply_markup={"inline_keyboard": keyboard})
+        return True
+
     if cmd == "/sessions":
         chat_key = str(chat_id)
         user_data = user_sessions.get(chat_key, {})
@@ -5909,7 +5993,7 @@ Send a message to start working!""")
         active_id = user_data.get("active")
 
         if not sessions:
-            send_message(chat_id, "No sessions yet. Use `/new <project>` to start one.")
+            send_message(chat_id, "No sessions yet. Use `/new <project>` or `/projects` to start one.")
             return True
 
         lines = ["*Your Sessions* (点按钮切换/恢复):\n"]
@@ -6528,6 +6612,18 @@ def handle_callback_query(callback_query):
 
 
     # Handle session resume
+    if data.startswith("proj_"):
+        try:
+            idx = int(data[5:])
+            names = pending_projects.get(chat_key, [])
+            if 0 <= idx < len(names):
+                handle_command(chat_id, f"/new {names[idx]}")
+                return
+        except (ValueError, IndexError):
+            pass
+        send_message(chat_id, "❌ Project not found. Send /projects again.")
+        return
+
     if data.startswith("resume_"):
         try:
             idx = int(data[7:])  # Remove "resume_" prefix
@@ -6980,6 +7076,7 @@ def startup():
     try:
         commands = [
             {"command": "new", "description": "Start new session - /new <project>"},
+            {"command": "projects", "description": "Pick a project folder to enter (tap)"},
             {"command": "resume", "description": "Pick a session to resume"},
             {"command": "sessions", "description": "List all sessions"},
             {"command": "csessions", "description": "Reuse a desktop Claude session"},
@@ -7092,6 +7189,13 @@ def startup():
         print(f"API server failed to start: {e}", flush=True)
         import traceback
         traceback.print_exc()
+
+    # Start Feishu channel (WebSocket long connection); no-op if not configured
+    try:
+        import feishu_channel
+        feishu_channel.start()
+    except Exception as e:
+        print(f"Feishu channel failed to start: {e}", flush=True)
 
     # Start scheduled task checker
     _start_scheduler()
