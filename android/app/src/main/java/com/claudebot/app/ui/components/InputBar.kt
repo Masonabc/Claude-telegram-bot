@@ -47,6 +47,7 @@ private val COMMANDS = listOf(
     BotCommand("/new", "New session in ~/project", true),
     BotCommand("/resume", "Pick a session to resume", false),
     BotCommand("/sessions", "List all sessions", false),
+    BotCommand("/csessions", "Browse & resume real Claude sessions", false),
     BotCommand("/switch", "Switch session by name", true),
     BotCommand("/status", "Show current status", false),
     BotCommand("/cancel", "Cancel current task", false),

@@ -757,6 +757,7 @@ def start(host: str, port: int):
         if host not in ("0.0.0.0", "127.0.0.1", "localhost", ""):
             _wait_for_interface(host)
 
+        effective_host = host
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _ws_event_loop = loop
