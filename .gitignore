@@ -33,6 +33,12 @@ __pycache__/
 *.swp
 *.swo
 
+# Xcode per-user state (window layout, scheme ordering)
+xcuserdata/
+
+# Claude Code local overrides (machine-specific paths and permissions)
+.claude/
+
 # Android build artifacts
 android/.gradle/
 android/build/
