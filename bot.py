@@ -7278,6 +7278,15 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda s, f: (save_sessions(force=True), os._exit(0)))
     signal.signal(signal.SIGINT, lambda s, f: (save_sessions(force=True), os._exit(0)))
 
+    # No Telegram token configured -> skip polling entirely. Without this the
+    # loop hammers getUpdates with a placeholder token and logs an error every
+    # backoff cycle; other channels (Feishu, API server) run in their own
+    # threads and keep working.
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("TELEGRAM_TOKEN not set - Telegram polling disabled; other channels keep running", flush=True)
+        while True:
+            time.sleep(3600)
+
     while True:
         updates = get_updates(last_update_id + 1)
         for update in updates:
