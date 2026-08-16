@@ -101,6 +101,7 @@ cancelled_sessions = set()  # session_ids explicitly cancelled via /cancel
 user_feedback_queue = {}  # "chat_id:session_id" -> [messages] — user messages during justdoit/omni
 pending_claude_sessions = {}  # chat_key -> [candidate dicts] — /csessions scan results awaiting selection
 pending_projects = {}  # chat_key -> [project_name] — /projects dir list awaiting tap selection
+pending_new_worktree = {}  # chat_key -> {project_name, cwd} — /new awaiting worktree-or-not choice
 scheduled_tasks = {}  # task_id -> {id, chat_id, cwd, prompt, schedule_type, cron_expr, last_result, ...}
 _scheduled_tasks_lock = threading.Lock()
 _scheduler_generation = 0
@@ -1931,6 +1932,59 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         else:
             edit_message(chat_id, message_id, error_text[:3950] + "\n\n_(...truncated)_", force=True)
         return f"Error: {e}", [], message_id, None, context_overflow
+
+
+def _is_git_repo(cwd):
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def create_bot_worktree(repo_dir):
+    """Create an isolated git worktree for a bot session. Returns (path, branch).
+
+    Worktrees live under ~/.claude/worktrees/ so they never show up as
+    untracked files in the main repo, and _session_title recognizes the
+    path as a worktree session."""
+    base = os.path.basename(repo_dir.rstrip("/")) or "repo"
+    name = f"{base}-bot-{datetime.now().strftime('%m%d-%H%M%S')}"
+    wt_root = os.path.expanduser("~/.claude/worktrees")
+    os.makedirs(wt_root, exist_ok=True)
+    wt_dir = os.path.join(wt_root, name)
+    branch = f"bot/{name}"
+    r = subprocess.run(["git", "-C", repo_dir, "worktree", "add", wt_dir, "-b", branch],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip())
+    return wt_dir, branch
+
+
+def start_new_session(chat_id, project_name, cwd, worktree_main=None, worktree_branch=None):
+    """Create a session and announce it. Shared by /new and the worktree-choice callback."""
+    session = create_session(chat_id, project_name, cwd)
+    if worktree_main:
+        session["worktree_main"] = worktree_main
+        session["worktree_branch"] = worktree_branch
+        save_sessions(force=True)
+        send_message(chat_id, f"""✅ *Session Started* 🌿
+
+• Project: `{project_name}`
+• Worktree: `{cwd}`
+• Branch: `{worktree_branch}`
+• 主仓库: `{worktree_main}` (不受影响)
+
+Send a message to start working!""")
+    else:
+        send_message(chat_id, f"""✅ *Session Started*
+
+• Project: `{project_name}`
+• Directory: `{cwd}`
+
+Send a message to start working!""")
+    return session
 
 
 def create_session(chat_id, project_name, cwd):
@@ -5879,7 +5933,7 @@ Example: `/schedule daily 09:00 | Run tests and fix failures`""")
 • `/csessions [项目|all]` - 浏览并复用电脑上的 Claude 会话(终端里跑的也能续)
 • `/switch <name>` - Switch to a session by name
 • `/delete <name>` - Delete a session (or `/delete all`)
-• `/reset` - Clear conversation history (fresh start)
+• `/reset` (or `/clear`) - Clear conversation history (fresh start)
 • `/end` - End current session
 • `/status` - Show current session info
 
@@ -5952,13 +6006,21 @@ Just send a message to chat with Claude!""")
             send_message(chat_id, f"❌ Directory not found: `{cwd}`\n\nMake sure the project exists.")
             return True
 
-        session = create_session(chat_id, project_name, cwd)
-        send_message(chat_id, f"""✅ *Session Started*
+        # Git repo → let the user pick isolation mode before creating the session
+        if _is_git_repo(cwd):
+            pending_new_worktree[str(chat_id)] = {"project_name": project_name, "cwd": cwd}
+            kb = {"inline_keyboard": [
+                [{"text": "🌿 开 worktree 隔离改", "callback_data": "newwt_yes"}],
+                [{"text": "📁 直接在项目里改", "callback_data": "newwt_no"}],
+            ]}
+            send_message(chat_id,
+                         f"📂 `{project_name}` 是个 git 仓库。\n\n"
+                         "要不要用 *worktree* 方式工作?\n"
+                         "_worktree = 复制出一份独立工作副本,挂在新分支上,改动不碰主工作区_",
+                         reply_markup=kb)
+            return True
 
-• Project: `{project_name}`
-• Directory: `{cwd}`
-
-Send a message to start working!""")
+        start_new_session(chat_id, project_name, cwd)
         return True
 
     if cmd in ("/projects", "/cd", "/p"):
@@ -6186,7 +6248,7 @@ Send a message to start working!""")
         send_message(chat_id, "Session ended. Use `/new <project>` to start a new one.")
         return True
 
-    if cmd == "/reset":
+    if cmd in ("/reset", "/clear"):
         session = get_active_session(chat_id)
         if not session:
             send_message(chat_id, "No active session. Use `/new <project>` first.")
@@ -6610,6 +6672,26 @@ def handle_callback_query(callback_query):
     answer_callback_query(query_id)
     edit_message_reply_markup(chat_id, message_id, None)  # Remove buttons
 
+
+    # Worktree-or-not choice after /new on a git repo
+    if data in ("newwt_yes", "newwt_no"):
+        pending = pending_new_worktree.pop(chat_key, None)
+        if not pending:
+            send_message(chat_id, "❌ 这次选择已过期,请重新发 `/new <项目>`。")
+            return
+        if data == "newwt_no":
+            start_new_session(chat_id, pending["project_name"], pending["cwd"])
+            return
+        try:
+            wt_dir, branch = create_bot_worktree(pending["cwd"])
+        except Exception as e:
+            send_message(chat_id,
+                         f"❌ worktree 创建失败: `{e}`\n\n"
+                         "会话没有创建。可以重新发 `/new <项目>` 再试,或选「直接在项目里改」。")
+            return
+        start_new_session(chat_id, pending["project_name"] + " 🌿", wt_dir,
+                          worktree_main=pending["cwd"], worktree_branch=branch)
+        return
 
     # Handle session resume
     if data.startswith("proj_"):
