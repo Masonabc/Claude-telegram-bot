@@ -5781,6 +5781,63 @@ _Session preserved. You can continue chatting._""")
         _ws_session_override.name = None
 
 
+def _send_project_picker(chat_id, rel=""):
+    """列出 BASE_PROJECTS_DIR/rel 下的目录，每个给"选它"和"进入"两个按钮。
+
+    点名字 = 直接用该目录开会话；点「进入 ▸」= 展开它的下一层。
+    是否下钻完全由用户决定，不做自动判断。"""
+    base = os.path.join(BASE_PROJECTS_DIR, rel) if rel else BASE_PROJECTS_DIR
+    try:
+        entries = []
+        for name in os.listdir(base):
+            full = os.path.join(base, name)
+            if name.startswith(".") or not os.path.isdir(full):
+                continue
+            entries.append((name, os.path.getmtime(full)))
+    except Exception as e:
+        send_message(chat_id, f"❌ Could not list `{base}`: {e}")
+        return
+
+    if not entries:
+        send_message(chat_id, f"`{rel or BASE_PROJECTS_DIR}` 下没有子目录。")
+        return
+
+    entries.sort(key=lambda e: e[1], reverse=True)
+    names = [n for n, _ in entries[:20]]
+    pending_projects[str(chat_id)] = {"rel": rel, "names": names}
+
+    keyboard = []
+    for i, n in enumerate(names):
+        full = os.path.join(base, n)
+        is_repo = os.path.isdir(os.path.join(full, ".git"))
+        try:
+            has_sub = any(
+                not d.startswith(".") and os.path.isdir(os.path.join(full, d))
+                for d in os.listdir(full)
+            )
+        except OSError:
+            has_sub = False
+        row = [{"text": f"{'📦' if is_repo else '📁'} {n}",
+                "callback_data": f"projpick_{i}"}]
+        if has_sub:
+            row.append({"text": "进入 ▸", "callback_data": f"projinto_{i}"})
+        keyboard.append(row)
+
+    nav = []
+    if rel:
+        nav.append({"text": "⬆️ 上一级", "callback_data": "projup"})
+        nav.append({"text": "✅ 就用当前目录", "callback_data": "projhere"})
+        keyboard.append(nav)
+
+    send_message(
+        chat_id,
+        f"*选择项目* — 当前在 `{rel or BASE_PROJECTS_DIR}`\n"
+        f"点名字 = 用它开会话 · 点「进入 ▸」= 看它下面还有什么\n"
+        f"📦 = git 仓库 · 📁 = 普通目录",
+        reply_markup={"inline_keyboard": keyboard},
+    )
+
+
 def handle_command(chat_id, text):
     """Handle bot commands. Returns True if handled."""
     parts = text.split(maxsplit=1)
@@ -6024,28 +6081,7 @@ Just send a message to chat with Claude!""")
         return True
 
     if cmd in ("/projects", "/cd", "/p"):
-        try:
-            entries = []
-            for name in os.listdir(BASE_PROJECTS_DIR):
-                full = os.path.join(BASE_PROJECTS_DIR, name)
-                if name.startswith(".") or not os.path.isdir(full):
-                    continue
-                entries.append((name, os.path.getmtime(full)))
-        except Exception as e:
-            send_message(chat_id, f"❌ Could not list projects: {e}")
-            return True
-
-        if not entries:
-            send_message(chat_id, f"No project folders found in `{BASE_PROJECTS_DIR}`.")
-            return True
-
-        # Most-recently-modified first; cap so the card/keyboard stays tappable
-        entries.sort(key=lambda e: e[1], reverse=True)
-        names = [n for n, _ in entries[:24]]
-        pending_projects[str(chat_id)] = names
-
-        keyboard = [[{"text": f"📁 {n}", "callback_data": f"proj_{i}"}] for i, n in enumerate(names)]
-        send_message(chat_id, "*选择项目* (点一下进入):", reply_markup={"inline_keyboard": keyboard})
+        _send_project_picker(chat_id, args.strip() if args else "")
         return True
 
     if cmd == "/sessions":
@@ -6694,10 +6730,42 @@ def handle_callback_query(callback_query):
         return
 
     # Handle session resume
+    if data.startswith(("projpick_", "projinto_")):
+        st = pending_projects.get(chat_key) or {}
+        names = st.get("names", []) if isinstance(st, dict) else []
+        rel = st.get("rel", "") if isinstance(st, dict) else ""
+        try:
+            idx = int(data.split("_", 1)[1])
+        except (ValueError, IndexError):
+            return
+        if 0 <= idx < len(names):
+            new_rel = os.path.join(rel, names[idx]) if rel else names[idx]
+            if data.startswith("projpick_"):
+                handle_command(chat_id, f"/new {new_rel}")
+            else:
+                _send_project_picker(chat_id, new_rel)
+        return
+
+    if data == "projup":
+        st = pending_projects.get(chat_key) or {}
+        rel = st.get("rel", "") if isinstance(st, dict) else ""
+        _send_project_picker(chat_id, os.path.dirname(rel))
+        return
+
+    if data == "projhere":
+        st = pending_projects.get(chat_key) or {}
+        rel = st.get("rel", "") if isinstance(st, dict) else ""
+        if rel:
+            handle_command(chat_id, f"/new {rel}")
+        else:
+            send_message(chat_id, "这是根目录，请先选一个具体项目。")
+        return
+
     if data.startswith("proj_"):
         try:
             idx = int(data[5:])
-            names = pending_projects.get(chat_key, [])
+            st = pending_projects.get(chat_key) or {}
+            names = st.get("names", []) if isinstance(st, dict) else st
             if 0 <= idx < len(names):
                 handle_command(chat_id, f"/new {names[idx]}")
                 return
@@ -7180,11 +7248,14 @@ def startup():
             {"command": "init", "description": "Run claude init"},
             {"command": "help", "description": "Show help"},
         ]
-        resp = requests.post(f"{API_URL}/setMyCommands", json={"commands": commands}, timeout=10)
-        if resp.json().get("ok"):
-            print("Bot menu commands registered.")
+        if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
+            print("TELEGRAM_TOKEN not set - skipping Telegram command menu registration", flush=True)
         else:
-            print(f"Failed to register commands: {resp.json().get('description')}")
+            resp = requests.post(f"{API_URL}/setMyCommands", json={"commands": commands}, timeout=10)
+            if resp.json().get("ok"):
+                print("Bot menu commands registered.")
+            else:
+                print(f"Failed to register commands: {resp.json().get('description')}")
     except Exception as e:
         print(f"Error registering commands: {e}")
 
@@ -7291,6 +7362,15 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, lambda s, f: (save_sessions(force=True), os._exit(0)))
     signal.signal(signal.SIGINT, lambda s, f: (save_sessions(force=True), os._exit(0)))
+
+    # No Telegram token configured -> skip polling entirely. Without this the
+    # loop hammers getUpdates with a placeholder token and logs an error every
+    # backoff cycle; other channels (Feishu, API server) run in their own
+    # threads and keep working.
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("TELEGRAM_TOKEN not set - Telegram polling disabled; other channels keep running", flush=True)
+        while True:
+            time.sleep(3600)
 
     while True:
         updates = get_updates(last_update_id + 1)
