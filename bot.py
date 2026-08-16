@@ -7360,8 +7360,25 @@ if __name__ == "__main__":
     startup()
     print("WARNING: Running bot.py directly. Use loader.py for hot-reload support.", flush=True)
 
-    signal.signal(signal.SIGTERM, lambda s, f: (save_sessions(force=True), os._exit(0)))
-    signal.signal(signal.SIGINT, lambda s, f: (save_sessions(force=True), os._exit(0)))
+    def _graceful_exit(signum, frame):
+        """Flush state, then drop the crash-recovery markers before exiting.
+
+        check_interrupted_sessions/check_interrupted_tasks treat a leftover
+        marker file as proof of a crash. Clearing them on a signalled exit is
+        what separates an intentional restart from a real crash — otherwise
+        every deploy or `launchctl kickstart` greets the user with a bogus
+        "Bot crashed and restarted" notice.
+        """
+        save_sessions(force=True)
+        for marker in (ACTIVE_SESSIONS_FILE, ACTIVE_TASKS_FILE):
+            try:
+                marker.unlink(missing_ok=True)
+            except Exception:
+                pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    signal.signal(signal.SIGINT, _graceful_exit)
 
     # No Telegram token configured -> skip polling entirely. Without this the
     # loop hammers getUpdates with a placeholder token and logs an error every
