@@ -7166,11 +7166,14 @@ def startup():
             {"command": "init", "description": "Run claude init"},
             {"command": "help", "description": "Show help"},
         ]
-        resp = requests.post(f"{API_URL}/setMyCommands", json={"commands": commands}, timeout=10)
-        if resp.json().get("ok"):
-            print("Bot menu commands registered.")
+        if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
+            print("TELEGRAM_TOKEN not set - skipping Telegram command menu registration", flush=True)
         else:
-            print(f"Failed to register commands: {resp.json().get('description')}")
+            resp = requests.post(f"{API_URL}/setMyCommands", json={"commands": commands}, timeout=10)
+            if resp.json().get("ok"):
+                print("Bot menu commands registered.")
+            else:
+                print(f"Failed to register commands: {resp.json().get('description')}")
     except Exception as e:
         print(f"Error registering commands: {e}")
 
